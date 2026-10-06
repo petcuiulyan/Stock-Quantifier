@@ -1,3 +1,4 @@
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -96,6 +97,127 @@ def metrics(s, h):
             "Max drawdown": f"{(curve / curve.cummax() - 1).min():.1%}"}
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_ohlc(t):
+    d = yf.download(t, period="2y", auto_adjust=True, progress=False)
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    d = d.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]].dropna(subset=["close"])
+    for c in ("open", "high", "low"):
+        d[c] = d[c].fillna(d["close"])
+    d["volume"] = d["volume"].fillna(0)
+    return d
+
+
+# --- volume profile ---
+def profile(w, edges):
+    """Volumul fiecarei zile e impartit egal pe nivelurile de pret dintre low si high."""
+    vol = np.zeros(len(edges) - 1)
+    for h_, l_, v_ in zip(w["high"], w["low"], w["volume"]):
+        m = (edges[1:] > l_) & (edges[:-1] < h_)
+        if m.any():
+            vol[m] += (v_ if v_ > 0 else 1.0) / m.sum()
+    return vol
+
+
+def value_area(vol, poc, share=0.7):
+    lo = hi = poc
+    acc, tot = vol[poc], vol.sum()
+    while acc < share * tot and (lo > 0 or hi < len(vol) - 1):
+        up = vol[hi + 1] if hi < len(vol) - 1 else -1
+        dn = vol[lo - 1] if lo > 0 else -1
+        if up >= dn:
+            hi += 1; acc += vol[hi]
+        else:
+            lo -= 1; acc += vol[lo]
+    return lo, hi
+
+
+def find_clusters(vol, k=3, sep=3, thr=0.5):
+    s = np.convolve(vol, np.ones(3) / 3, mode="same")
+    peaks = []
+    for i in np.argsort(s)[::-1]:
+        if all(abs(i - p) >= sep for p in peaks):
+            peaks.append(int(i))
+        if len(peaks) == k:
+            break
+    out = []
+    for p in peaks:
+        a = b = p
+        while a > 0 and s[a - 1] >= thr * s[p]:
+            a -= 1
+        while b < len(s) - 1 and s[b + 1] >= thr * s[p]:
+            b += 1
+        out.append((a, b, p))
+    return out
+
+
+def analyze(d, n=60, recent=20, bins=40):
+    w = d.tail(n)
+    lo, hi = w["low"].min(), w["high"].max()
+    edges = np.linspace(lo, hi, bins + 1)
+    mids = (edges[:-1] + edges[1:]) / 2
+    vol = profile(w, edges)
+    poc = int(vol.argmax())
+    v0, v1 = value_area(vol, poc)
+
+    # clusterul de trend = unde se concentreaza volumul in ultimele 'recent' zile
+    rvol = profile(w.tail(recent), edges)
+    rp = int(rvol.argmax())
+    a = b = rp
+    while a > 0 and rvol[a - 1] >= 0.5 * rvol[rp]:
+        a -= 1
+    while b < bins - 1 and rvol[b + 1] >= 0.5 * rvol[rp]:
+        b += 1
+
+    c = d["close"]
+    px, s20, s50 = c.iloc[-1], c.rolling(20).mean().iloc[-1], c.rolling(50).mean().iloc[-1]
+    trend = "Ascendent" if (px > s50 and s20 > s50) else "Descendent" if (px < s50 and s20 < s50) else "Lateral"
+
+    # zona de acumulare: cluster major, in jumatatea de jos a intervalului, cu zile "stranse" si volum peste medie
+    acc = None
+    avg_rng = ((w["high"] - w["low"]) / w["close"]).mean()
+    for ca, cb, _ in find_clusters(vol):
+        blo, bhi = edges[ca], edges[cb + 1]
+        days = w[(w["close"] >= blo) & (w["close"] <= bhi)]
+        if len(days) < 0.25 * len(w):
+            continue
+        rng_in = ((days["high"] - days["low"]) / days["close"]).mean()
+        if (rng_in < 0.9 * avg_rng and days["volume"].mean() > w["volume"].mean()
+                and (blo + bhi) / 2 <= lo + 0.5 * (hi - lo)):
+            acc = (ca, cb)
+            break
+
+    zones = ["Alt volum"] * bins
+    for i in range(v0, v1 + 1):
+        zones[i] = "In Value Area"
+    for i in range(a, b + 1):
+        zones[i] = "Cluster trend"
+    if acc:
+        for i in range(acc[0], acc[1] + 1):
+            zones[i] = "Zona de acumulare"
+    return dict(edges=edges, vol=vol, zones=zones, px=px, poc_p=mids[poc], trend=trend,
+                val=edges[v0], vah=edges[v1 + 1], trend_band=(edges[a], edges[b + 1]),
+                acc_band=(edges[acc[0]], edges[acc[1] + 1]) if acc else None,
+                shift="in sus" if rp > poc else "in jos" if rp < poc else "stabil")
+# --- end volume profile ---
+
+
+def vp_chart(r):
+    df = pd.DataFrame({"lo": r["edges"][:-1], "hi": r["edges"][1:], "vol": r["vol"],
+                       "zona": r["zones"], "zero": 0.0})
+    y = alt.Y("lo:Q", title="Pret", scale=alt.Scale(zero=False))
+    bars = alt.Chart(df).mark_rect().encode(
+        y=y, y2="hi:Q", x=alt.X("zero:Q", title="Volum"), x2="vol:Q",
+        color=alt.Color("zona:N", legend=alt.Legend(orient="bottom", title=None),
+                        scale=alt.Scale(domain=["Zona de acumulare", "Cluster trend", "In Value Area", "Alt volum"],
+                                        range=["#f5c542", "#2e9cff", "#7a8499", "#3b4252"])))
+    ry = alt.Y("p:Q", scale=alt.Scale(zero=False))
+    px = alt.Chart(pd.DataFrame({"p": [r["px"]]})).mark_rule(color="white", strokeDash=[5, 3]).encode(y=ry)
+    poc = alt.Chart(pd.DataFrame({"p": [r["poc_p"]]})).mark_rule(color="#ff8c42").encode(y=ry)
+    return (bars + px + poc).properties(height=360)
+
+
 if run:
     tick = []
     if "NASDAQ-100" in univ:
@@ -158,7 +280,7 @@ if run:
                  f"Strategie: {ms}. Benchmark: {mb}. Top semnale la {data['date'].max().date()}: "
                  f"{signals.head(top_k)[['nume', 'prob']].round(3).to_dict('records')}"))
 
-tab1, tab2, tab3 = st.tabs(["Top candidati LONG", "Backtest", "Asistent AI"])
+tab1, tabv, tab2, tab3 = st.tabs(["Top candidati LONG", "Profil volum", "Backtest", "Asistent AI"])
 
 with tab1:
     if "signals" not in st.session_state:
@@ -185,6 +307,40 @@ with tab1:
                          use_container_width=True)
         if st.session_state["skipped"]:
             st.caption(f"Ignorate (fara date suficiente): {', '.join(st.session_state['skipped'])}")
+
+with tabv:
+    if "signals" not in st.session_state:
+        st.info("Ruleaza intai analiza.")
+    else:
+        s = st.session_state["signals"]
+        stocks = s[s["tip"] == "Actiune"]["ticker"].head(2).tolist()
+        com = st.selectbox("Materie prima", list(COMMOD), index=0, format_func=lambda t: COMMOD[t])
+        k1, k2 = st.columns(2)
+        n_days = k1.slider("Fereastra profil (zile)", 30, 120, 60)
+        n_rec = k2.slider("Fereastra cluster trend (zile)", 10, 30, 20)
+        vp_notes = []
+        for t in stocks + [com]:
+            st.subheader(f"{COMMOD.get(t, t)} ({t})")
+            d = load_ohlc(t)
+            if len(d) < n_days + 60:
+                st.warning("Prea putine date pentru profil.")
+                continue
+            r = analyze(d, n_days, n_rec)
+            hl = (f"Zona de acumulare {r['acc_band'][0]:.2f} - {r['acc_band'][1]:.2f}" if r["acc_band"]
+                  else f"Cluster trend {r['trend_band'][0]:.2f} - {r['trend_band'][1]:.2f}")
+            st.markdown(f"**Zona evidentiata:** {hl}  \n"
+                        f"**Trend:** {r['trend']} | **Pret:** {r['px']:.2f} | **POC:** {r['poc_p']:.2f} | "
+                        f"**Value Area:** {r['val']:.2f} - {r['vah']:.2f}  \n"
+                        f"**Volumul recent se muta:** {r['shift']} fata de POC-ul ferestrei")
+            if r["acc_band"]:
+                st.caption(f"Cluster trend (ultimele {n_rec} zile): {r['trend_band'][0]:.2f} - {r['trend_band'][1]:.2f}")
+            st.altair_chart(vp_chart(r), use_container_width=True)
+            vp_notes.append(f"{COMMOD.get(t, t)}: trend {r['trend']}, pret {r['px']:.2f}, POC {r['poc_p']:.2f}, {hl}")
+        st.caption("Alb = pret curent, portocaliu = POC. Profil construit din date zilnice (volumul zilei e impartit "
+                   "pe intervalul low-high), deci e o aproximare. Zona de acumulare = cluster major in jumatatea "
+                   "de jos a intervalului, cu zile cu variatie mica si volum peste medie; daca exista, e evidentiata "
+                   "in locul clusterului de trend.")
+        st.session_state["vp"] = " | ".join(vp_notes)
 
 with tab2:
     if "res" not in st.session_state:
@@ -219,7 +375,8 @@ with tab3:
             st.chat_message("user").write(q)
             system = ("Esti asistentul unei aplicatii educationale de trading cantitativ. Raspunde in romana, "
                       "onest, fara promisiuni de profit; mentioneaza riscurile si limitele backtestului. "
-                      "Rezultate curente: " + st.session_state.get("summary", "inca nerulat"))
+                      "Rezultate curente: " + st.session_state.get("summary", "inca nerulat")
+                      + " Profil volum: " + st.session_state.get("vp", "indisponibil"))
             r = client.messages.create(model="claude-sonnet-5-5", max_tokens=800, system=system, messages=chat)
             ans = r.content[0].text
             chat.append({"role": "assistant", "content": ans})
