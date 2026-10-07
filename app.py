@@ -1,5 +1,9 @@
+import base64
+import io
+
 import altair as alt
 import numpy as np
+import requests
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -218,6 +222,121 @@ def vp_chart(r):
     return (bars + px + poc).properties(height=360)
 
 
+# --- journal ---
+JCOLS = ["data_semnal", "ticker", "nume", "tip", "prob", "orizont", "flow_call", "flow_put",
+         "gap", "open_high", "open_close", "close_close", "ret_H"]
+JNUM = ["prob", "orizont", "flow_call", "flow_put", "gap", "open_high", "open_close", "close_close", "ret_H"]
+
+
+def get_flow(ticker):
+    """LOC REZERVAT pentru fluxul de optiuni. Aici se conecteaza ulterior API-ul Unusual Whales
+    (cheia ar sta in st.secrets['UW_API_KEY']) sau datele lipite manual. Intoarce (prima_call, prima_put)."""
+    return np.nan, np.nan
+
+
+def base_rates(raw, ok, years=3):
+    parts = []
+    for t in ok:
+        o, h, c = raw["Open"][t], raw["High"][t], raw["Close"][t]
+        df = pd.DataFrame({"cc": c / c.shift(1) - 1, "oh": h / o - 1}).dropna()
+        df["tip"] = "Materie prima" if t in COMMOD else "Actiune"
+        parts.append(df)
+    a = pd.concat(parts)
+    a = a[a.index >= a.index.max() - pd.DateOffset(years=years)]
+    rows = []
+    for tip, g in a.groupby("tip"):
+        for name, col in [("Inchidere vs ziua anterioara", "cc"), ("Maxim vs deschidere", "oh")]:
+            rows.append({"Grup": tip, "Masura": name,
+                         **{f">= {x}%": f"{(g[col] >= x / 100).mean():.2%}" for x in (3, 6, 10)},
+                         "Zile-instrument": len(g)})
+    return pd.DataFrame(rows)
+
+
+def _gh():
+    try:
+        if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+            return ({"Authorization": f"Bearer {st.secrets['GITHUB_TOKEN']}",
+                     "Accept": "application/vnd.github+json"},
+                    f"https://api.github.com/repos/{st.secrets['GITHUB_REPO']}/contents/journal.csv")
+    except Exception:
+        pass
+    return None
+
+
+def _clean(df):
+    df = df.reindex(columns=JCOLS)
+    for c in JNUM:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def journal_remote():
+    g = _gh()
+    if not g:
+        return None, None
+    try:
+        r = requests.get(g[1], headers=g[0], timeout=20)
+        if r.status_code == 200:
+            js = r.json()
+            return pd.read_csv(io.StringIO(base64.b64decode(js["content"]).decode())), js["sha"]
+        if r.status_code == 404:
+            return pd.DataFrame(columns=JCOLS), None
+        st.warning(f"GitHub a raspuns {r.status_code}; folosesc stocarea din sesiune.")
+    except Exception as e:
+        st.warning(f"GitHub indisponibil: {e}")
+    return None, None
+
+
+def journal_get():
+    if "journal" not in st.session_state:
+        df, _ = journal_remote()
+        st.session_state["journal"] = _clean(df if df is not None else pd.DataFrame(columns=JCOLS))
+    return st.session_state["journal"]
+
+
+def journal_save(df):
+    df = _clean(df)
+    st.session_state["journal"] = df
+    g = _gh()
+    if g:
+        _, sha = journal_remote()
+        body = {"message": "update journal", "content": base64.b64encode(df.to_csv(index=False).encode()).decode()}
+        if sha:
+            body["sha"] = sha
+        try:
+            r = requests.put(g[1], headers=g[0], json=body, timeout=20)
+            if r.status_code not in (200, 201):
+                st.error(f"Salvarea in GitHub a esuat ({r.status_code}). Jurnalul ramane in sesiune; descarca CSV.")
+        except Exception as e:
+            st.error(f"Salvarea in GitHub a esuat: {e}")
+
+
+def fill_outcomes(j):
+    """Pentru fiecare semnal (data D, dupa inchidere) completeaza ce s-a intamplat in ziua urmatoare."""
+    j = j.copy()
+    for i, r in j.iterrows():
+        if pd.notna(r["close_close"]) and pd.notna(r["ret_H"]):
+            continue
+        try:
+            d = load_ohlc(r["ticker"])
+        except Exception:
+            continue
+        sd = pd.Timestamp(r["data_semnal"])
+        pos = d.index.searchsorted(sd)
+        if pos >= len(d) or d.index[pos].normalize() != sd:
+            continue
+        c0 = d["close"].iloc[pos]
+        if pos + 1 < len(d):
+            n = d.iloc[pos + 1]
+            j.loc[i, ["gap", "open_high", "open_close", "close_close"]] = [
+                n["open"] / c0 - 1, n["high"] / n["open"] - 1, n["close"] / n["open"] - 1, n["close"] / c0 - 1]
+        h = int(r["orizont"])
+        if pos + h < len(d):
+            j.loc[i, "ret_H"] = d["close"].iloc[pos + h] / c0 - 1
+    return j
+# --- end journal ---
+
+
 if run:
     tick = []
     if "NASDAQ-100" in univ:
@@ -234,6 +353,7 @@ if run:
     avail = raw["Close"].columns
     ok = [t for t in tick if t in avail and raw["Close"][t].notna().sum() > 300]
     skipped = [t for t in tick if t not in ok]
+    st.session_state["base_stats"] = base_rates(raw, ok)
 
     data = pd.concat([features(raw, t, horizon) for t in ok]).reset_index()
     data = data.rename(columns={data.columns[0]: "date"})
@@ -280,7 +400,8 @@ if run:
                  f"Strategie: {ms}. Benchmark: {mb}. Top semnale la {data['date'].max().date()}: "
                  f"{signals.head(top_k)[['nume', 'prob']].round(3).to_dict('records')}"))
 
-tab1, tabv, tab2, tab3 = st.tabs(["Top candidati LONG", "Profil volum", "Backtest", "Asistent AI"])
+tab1, tabv, tabj, tab2, tab3 = st.tabs(
+    ["Top candidati LONG", "Profil volum", "Masurare si jurnal", "Backtest", "Asistent AI"])
 
 with tab1:
     if "signals" not in st.session_state:
@@ -341,6 +462,65 @@ with tabv:
                    "de jos a intervalului, cu zile cu variatie mica si volum peste medie; daca exista, e evidentiata "
                    "in locul clusterului de trend.")
         st.session_state["vp"] = " | ".join(vp_notes)
+
+with tabj:
+    st.subheader("1. Cat de rare sunt miscarile mari")
+    if "base_stats" in st.session_state:
+        st.dataframe(st.session_state["base_stats"], use_container_width=True, hide_index=True)
+        st.caption("Procentul de zile-instrument (ultimii 3 ani) cu miscarea respectiva. Asta e rata de baza: "
+                   "orice semnal trebuie sa o bata clar ca sa merite.")
+    else:
+        st.info("Ruleaza intai analiza (butonul din bara laterala).")
+
+    st.subheader("2. Jurnal de semnale")
+    journal = journal_get()
+    st.caption(("Stocare: GitHub (persistent)." if _gh() else
+                "Stocare: doar sesiunea curenta. Descarca CSV-ul des sau configureaza GitHub (vezi instructiunile).")
+               + " Salveaza semnalele dupa inchiderea pietei US (aprox. 23:00 ora Romaniei), nu in timpul sesiunii.")
+    b1, b2 = st.columns(2)
+    if b1.button("Salveaza top de azi in jurnal", disabled="signals" not in st.session_state):
+        s, asof, H = st.session_state["signals"], str(st.session_state["asof"]), st.session_state["horizon"]
+        new = []
+        for _, r in s.head(top_k).iterrows():
+            fc, fp = get_flow(r["ticker"])
+            new.append({"data_semnal": asof, "ticker": r["ticker"], "nume": r["nume"], "tip": r["tip"],
+                        "prob": round(float(r["prob"]), 4), "orizont": H, "flow_call": fc, "flow_put": fp})
+        j = pd.concat([journal, pd.DataFrame(new)]).drop_duplicates(["data_semnal", "ticker", "orizont"])
+        journal_save(j)
+        st.success(f"Salvat: {len(new)} semnale pentru {asof}.")
+        journal = journal_get()
+    if b2.button("Actualizeaza rezultatele"):
+        with st.spinner("Calculez ce s-a intamplat dupa fiecare semnal..."):
+            journal_save(fill_outcomes(journal))
+        journal = journal_get()
+
+    done = journal.dropna(subset=["close_close"])
+    if done.empty:
+        st.info("Niciun semnal rezolvat inca. Salveaza semnale azi, apoi apasa 'Actualizeaza' dupa urmatoarea zi de tranzactionare.")
+    else:
+        st.write(f"Semnale rezolvate: **{len(done)}** din {len(journal)}")
+        summ = {"Maxim >= 3% peste deschidere": (done["open_high"] >= 0.03).mean(),
+                "Maxim >= 6% peste deschidere": (done["open_high"] >= 0.06).mean(),
+                "Maxim >= 10% peste deschidere": (done["open_high"] >= 0.10).mean(),
+                "Inchidere > ziua anterioara": (done["close_close"] > 0).mean()}
+        tbl = pd.DataFrame({"Rata": {k: f"{v:.1%}" for k, v in summ.items()}})
+        tbl.loc["Medie gap la deschidere"] = f"{done['gap'].mean():+.2%}"
+        tbl.loc["Medie deschidere -> inchidere"] = f"{done['open_close'].mean():+.2%}"
+        tbl.loc["Medie inchidere vs ziua anterioara"] = f"{done['close_close'].mean():+.2%}"
+        st.table(tbl)
+        hdone = journal.dropna(subset=["ret_H"])
+        if len(hdone):
+            st.write(f"Dupa perioada de prognoza: pozitiv in **{(hdone['ret_H'] > 0).mean():.0%}** din "
+                     f"{len(hdone)} cazuri, medie {hdone['ret_H'].mean():+.2%}.")
+        st.caption("Compara cu rata de baza de mai sus. Sub ~30-50 de semnale rezolvate, rezultatele sunt zgomot.")
+
+    st.dataframe(journal.sort_values("data_semnal", ascending=False), use_container_width=True, hide_index=True)
+    st.download_button("Descarca jurnal (CSV)", journal.to_csv(index=False), "journal.csv", "text/csv")
+    up = st.file_uploader("Importa jurnal (CSV) - se combina cu cel curent", type="csv")
+    if up is not None and st.button("Importa"):
+        j = pd.concat([journal, _clean(pd.read_csv(up))]).drop_duplicates(["data_semnal", "ticker", "orizont"])
+        journal_save(j)
+        st.success("Importat.")
 
 with tab2:
     if "res" not in st.session_state:
